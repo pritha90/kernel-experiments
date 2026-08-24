@@ -6,7 +6,7 @@ implementations, **forward and backward**:
 | | |
 |---|---|
 | **TPU** | [tokamax PR #1103](https://github.com/openxla/tokamax/pull/1103), `tokamax/_src/ops/experimental/kda/` — Pallas/Mosaic |
-| **GPU** | [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention), `fla/ops/kda/` — Triton (`chunk_fwd.py` / `chunk_bwd.py`) |
+| **GPU** | [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention), `fla/ops/kda/` — Triton (`chunk_fwd.py` / `chunk_bwd.py`), plus its two pure-torch entry points |
 
 KDA is the delta rule with a **per-channel** gate: unlike Gated DeltaNet's
 scalar `exp(g_t)`, the state decays as a row scaling `diag(exp(g_t)) S`, with
@@ -81,10 +81,11 @@ kernel-vs-kernel number tells you nothing about which side moved.
       |
       +--> ref_  JAX fp64 forward + VJP (arbiter.py)      <- the arbiter
                   |
-        +---------+---------+
-        |                   |
-   tpuref_  tokamax xla   gpuref_  FLA naive_recurrent_kda
-   tpu_     tokamax mosaic   gpu_  FLA chunk_kda (Triton)
+        +---------+---------------+
+        |                         |
+   tpuref_  tokamax xla      gpuref_    FLA naive_recurrent_kda
+                             gpuchunk_  FLA naive_chunk_kda  (torch)
+   tpu_     tokamax mosaic   gpu_       FLA chunk_kda        (Triton)
 ```
 
 The arbiter's gradients come from autodiff, so they are only as trustworthy
@@ -93,13 +94,33 @@ as the forward they differentiate. That forward is therefore checked against
 imperative numpy loop. Both artifacts are stored in float64 for this reason:
 rounding either to fp32 would inject ~2e-09 and swamp the comparison.
 
-**Both `*ref_` references run on CPU.** That is new with the FLA retarget —
+**Only `--impl chunk` needs CUDA.** That is new with the FLA retarget —
 FlashKDA's torch reference is a bit-exact CUDA emulation and needed a device,
-so only the TPU conversions could be validated without hardware. FLA's
-`naive_recurrent_kda` is pure PyTorch, so the whole of stage 1 is now
-two-sided and laptop-runnable. Triton is not required either: if it is
-missing, `run_gpu.py` loads `naive.py` directly from the source tree, since
-`fla/ops/__init__.py` eagerly imports every Triton op in the library.
+so only the TPU conversions could be validated without hardware. FLA ships
+two pure-PyTorch entry points, so `run_gpu.py` runs on `cpu`, `mps`, or
+`cuda` and `--device` defaults to the best available. Triton is not required
+either: if it is missing, `run_gpu.py` loads `naive.py` directly from the
+source tree, since `fla/ops/__init__.py` eagerly imports every Triton op in
+the library.
+
+| `--impl` | FLA function | needs | artifact | role |
+|---|---|---|---|---|
+| `naive` | `naive_recurrent_kda` | nothing | `gpuref_` | stage 1: the recurrence, i.e. KDA's semantics |
+| `chunk_torch` | `naive_chunk_kda` | nothing | `gpuchunk_` | stage 2: the chunked algorithm, without CUDA |
+| `chunk` | `chunk_kda` | CUDA | `gpu_` | stage 2: the Triton kernel |
+
+`chunk_torch` matters because it splits stage 2's GPU side in two. It is the
+*same algorithm* `chunk_kda` implements — gate cumsum, UT transform / WY
+representation, Neumann inverse of `(I − tril(A))` — written in torch, so
+`tpu vs gpuchunk` is a genuine cross-implementation check that needs no
+NVIDIA GPU, and where the Triton kernel does run, `gpu vs gpuchunk` separates
+what the implementation adds from what the algorithm already had. That is the
+diagnostic role FlashKDA's `torch_ref` used to play, minus the device.
+
+Its two limits are real and are reported, not papered over: `naive_chunk_kda`
+asserts `T % chunk_size == 0`, and it casts every input `.to(torch.float)` on
+entry, so it measures algorithm error and not bf16 rounding whatever
+`--dtype` says.
 
 ## Stages
 
@@ -152,25 +173,64 @@ did.
 # on a TPU host
 PYTHONPATH=<tokamax-pr1103> python run_tpu.py --case all --impl mosaic \
     --dtype bfloat16 --backward
-# on a CUDA host
+# the GPU side, no CUDA required -- cpu/mps/cuda, auto-selected
+FLA_ROOT=<fla> python run_gpu.py --case all --impl chunk_torch --backward
+# the GPU side on a CUDA host
 python run_gpu.py --case all --impl chunk --dtype bfloat16 --backward
 # anywhere
 python compare.py --stage kernels
 ```
 
-**Status: not run against the current harness.** An earlier forward-only
+**GPU half: passing, 7/8 cases, forward and backward, via `chunk_torch`** —
+on CPU and on MPS, both exit 0. This is the chunked algorithm scored against
+the fp64 arbiter:
+
+| `gpuchunk vs arbiter` | worst across all cases |
+|---|---|
+| forward (`output`, `final_state`) | max\|Δ\| 8.4e-07 |
+| all eight gradients | rel-norm 5.5e-06 |
+
+`varlen_unaligned` is `SKIP`: its 100-token segment is not a multiple of the
+chunk size, which `naive_chunk_kda` asserts on.
+
+**TPU half: not run against the current harness.** An earlier forward-only
 revision was executed on a v7x TPU and all 7 cases then defined ran on Mosaic
 with no `NotImplementedError` (bf16 output max\|Δ\| 4.0e-04–7.0e-04 vs the
 arbiter, final_state 3.3e-03–5.6e-03). Those artifacts predate the
 post-sigmoid-beta input change, the added cotangents, and the `small_dim`
-case, so they are stale and are being regenerated rather than reused. The
-CUDA half has not run at all — FLA's KDA kernels are Triton-only.
+case, so they are stale and are being regenerated rather than reused.
+**Triton `--impl chunk`: not run** — no NVIDIA GPU available.
 
-`compare.py --stage kernels` prints, per tensor, `tpu vs arbiter`,
-`gpu vs arbiter`, `fla-naive vs arbiter`, and `tpu vs gpu`, so a
-cross-backend delta can be assigned to a specific kernel. Only `tpu vs gpu`
-decides pass/fail when both are present; with only one side present it says
-so explicitly and falls back to scoring against the arbiter.
+> **`naive_chunk_kda`'s backward returns NaN at `chunk_size=64`.** Found by
+> this harness. It builds its attention block as `(g − g_i).exp()` over the
+> full `BT×BT` tile, where `g` is the within-chunk gate cumsum, and masks the
+> upper triangle only *afterwards*. Above the diagonal that exponent is
+> positive and as large as the whole within-chunk span, which overflows fp32
+> to `+inf`. The forward is unharmed — `masked_fill` discards exactly those
+> entries — but the backward multiplies them by a zero cotangent and gets
+> `0 * inf`. On `fixed`, 170 of 1024 channels overflow and the span reaches
+> 123.5 against fp32's `exp` limit of 88.7; `dq`, `dk`, `dg`, `dbeta`,
+> `da_log`, `ddt_bias` all go NaN while `dv` and `dinitial_state`, which do
+> not flow through that `exp`, stay clean.
+>
+> The span is bounded by `chunk_size × |lower_bound|`, so at `lower_bound=-2`
+> overflow is structurally impossible at 32 and reachable at 64. Hence
+> `chunk_torch` defaults to **`--chunk-size 32`** rather than the 64 the two
+> kernels use: chunk size is internal blocking, the chunked form is
+> mathematically equivalent at any of them, and this is a torch stand-in
+> rather than the kernel whose tiling is under test. `run_gpu.py` measures
+> the real span per sequence and raises rather than writing NaN artifacts, so
+> `--chunk-size 64` reports the condition instead of failing mysteriously.
+> This is a defect in FLA's torch reference, not in its Triton kernel, which
+> computes the masked region differently.
+
+`compare.py --stage kernels` prints, per tensor, `tpu vs arbiter`, the FLA
+side vs arbiter, `fla-naive vs arbiter`, and the cross row, so a
+cross-backend delta can be assigned to a specific implementation. The FLA
+side is `gpu_` when it exists and `gpuchunk_` otherwise, and the report
+states which — a `gpuchunk` run is labelled as *not* exercising Triton. Only
+the cross row decides pass/fail when both sides are present; with one side it
+says so explicitly and falls back to scoring against the arbiter.
 
 `da_log` and `ddt_bias` are scored on relative norm rather than elementwise
 tolerance: they are reductions over every token and channel (shapes `[H]` and

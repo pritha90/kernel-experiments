@@ -11,6 +11,7 @@ disagreement is attributable rather than merely observed.
   tpuref_   tokamax implementation="xla", fp32
   tpu_      tokamax implementation="mosaic" -- the Pallas TPU kernel
   gpuref_   FLA naive_recurrent_kda, fp32 torch
+  gpuchunk_ FLA naive_chunk_kda -- the chunked algorithm in pure torch
   gpu_      FLA chunk_kda -- the Triton kernel
 
 Stages:
@@ -18,7 +19,9 @@ Stages:
                       validates the conversions in both runners, and -- via
                       npref vs ref -- the arbiter's own forward, which is
                       what licenses trusting its autodiff gradients.
-  --stage kernels     tpu and gpu vs the arbiter, and tpu vs gpu.
+  --stage kernels     tpu and the FLA side vs the arbiter, and tpu vs FLA.
+                      The FLA side is gpu_ when it exists, else gpuchunk_,
+                      which is the same chunked algorithm without CUDA.
 
 Comparison metric depends on the tensor. `output`, `final_state`, and the
 per-token gradients are compared elementwise. `da_log` and `ddt_bias` are
@@ -160,51 +163,77 @@ def compare_semantics(name: str, d: str) -> bool | None:
 def compare_kernels(name: str, d: str) -> bool | None:
   """Stage 2. Scores whatever kernel artifacts exist.
 
-  With both kernels present, `tpu vs gpu` is the verdict. With only one --
-  the usual situation, since a TPU host and a CUDA host are rarely the same
-  machine -- that kernel is scored against the arbiter instead, which is a
-  weaker but genuine result. It is reported as such, not as a cross-check.
+  The FLA side can be either of two things, and the report says which:
+
+    gpu_       chunk_kda, the Triton kernel. Needs CUDA.
+    gpuchunk_  naive_chunk_kda, the SAME chunked algorithm written in pure
+               torch. Runs on cpu/mps/cuda.
+
+  `gpuchunk_` is the fallback when there is no NVIDIA GPU. `tpu vs gpuchunk`
+  is still a genuine cross-implementation check -- Pallas/Mosaic against
+  FLA's chunked math, on shared inputs, scored by a common arbiter -- it just
+  does not exercise the Triton implementation. That distinction is printed,
+  not left to the reader.
+
+  With a TPU artifact and some FLA artifact, the cross row is the verdict.
+  With only one side, that side is scored against the arbiter instead, which
+  is weaker but genuine, and is labelled as such.
   """
   ref = _load(d, "ref", name)
-  tpu, gpu = _load(d, "tpu", name), _load(d, "gpu", name)
+  tpu = _load(d, "tpu", name)
+  gpu, gpuchunk = _load(d, "gpu", name), _load(d, "gpuchunk", name)
   gpuref = _load(d, "gpuref", name)
-  if tpu is None and gpu is None:
-    print(f"\n=== {name}: SKIP (no tpu_ or gpu_ artifact)")
+
+  # Prefer the real kernel; fall back to the torch chunked algorithm.
+  fla, fla_tag = ((gpu, "gpu") if gpu is not None else
+                  (gpuchunk, "gpuchunk") if gpuchunk is not None else
+                  (None, None))
+  if tpu is None and fla is None:
+    print(f"\n=== {name}: SKIP (no tpu_, gpu_ or gpuchunk_ artifact)")
     return None
   if ref is None:
     print(f"\n=== {name}: SKIP (no ref_ arbiter; run arbiter.py)")
     return None
 
-  both = tpu is not None and gpu is not None
+  both = tpu is not None and fla is not None
   _header(name)
+  if fla_tag == "gpuchunk":
+    print("  [FLA side is chunk_torch (pure torch), NOT the Triton kernel: "
+          "this checks the chunked algorithm, not the CUDA implementation]")
   if not both:
-    which = "tpu" if tpu is not None else "gpu"
+    which = "tpu" if tpu is not None else fla_tag
     print(f"  [one-sided: only {which}_ present -> scored against the "
-          f"arbiter, NOT a cross-device check]")
+          f"arbiter, NOT a cross-implementation check]")
 
   ok = True
   # Union, not intersection: if one side ran with --backward and the other
   # did not, the gradients it did produce should still be scored against the
   # arbiter rather than vanishing from the report.
-  have = set().union(*(s for s in (tpu, gpu) if s is not None))
+  have = set().union(*(s for s in (tpu, fla) if s is not None))
   for t in [t for t in TENSORS if t in ref and t in have]:
     print(f"  {t}")
-    for tag, side in (("tpu", tpu), ("gpu", gpu)):
+    for tag, side in (("tpu", tpu), (fla_tag, fla)):
       if side is not None and t in side:
         s = stats(side[t], ref[t])
         good = _ok(t, s, "kernels")
         print(_row(f"{tag} vs arbiter", s, good))
-        # One-sided runs have no cross-device row, so the arbiter rows are
-        # the verdict; otherwise they are diagnostic only.
+        # One-sided runs have no cross row, so the arbiter rows are the
+        # verdict; otherwise they are diagnostic only.
         if not both:
           ok &= good
+    # Diagnostics. Neither votes.
+    if gpuchunk is not None and fla_tag != "gpuchunk" and t in gpuchunk:
+      # With the Triton kernel present, gpuchunk localizes a GPU-side
+      # failure to the implementation rather than the algorithm.
+      s = stats(gpuchunk[t], ref[t])
+      print(_row("fla-chunk vs arb", s, _ok(t, s, "kernels")))
     if gpuref is not None and t in gpuref:
       s = stats(gpuref[t], ref[t])
       print(_row("fla-naive vs arb", s, _ok(t, s, "semantics")))
-    if both and t in tpu and t in gpu:
-      s = stats(tpu[t], gpu[t])
+    if both and t in tpu and t in fla:
+      s = stats(tpu[t], fla[t])
       good = _ok(t, s, "kernels")
-      print(_row("tpu vs gpu", s, good))
+      print(_row(f"tpu vs {fla_tag}", s, good))
       ok &= good
   return ok
 

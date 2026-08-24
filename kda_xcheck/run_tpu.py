@@ -7,12 +7,17 @@ Two implementations are exposed:
 
 The `xla` path is what makes the harness checkable without hardware: it is
 tokamax's own statement of KDA semantics, so agreement between it and the
-numpy arbiter in kda_case.py validates every layout/activation conversion
-below before either kernel is ever run.
+arbiter validates every layout/activation conversion below before either
+kernel is ever run.
+
+`--backward` additionally takes the VJP. tokamax returns gradients for
+exactly the eight inputs FLA's `ChunkKDAFunction.backward` returns
+(pallas_mosaic_tpu.py `grads`: query, key, value, gate, beta, a_log,
+delta_time_bias, initial_state), so the two are directly comparable.
 
 Usage:
   python run_tpu.py --case all --impl xla    --dtype float32   # stage 1
-  python run_tpu.py --case all --impl mosaic --dtype bfloat16  # stage 2
+  python run_tpu.py --case all --impl mosaic --dtype bfloat16 --backward
 """
 
 from __future__ import annotations
@@ -29,9 +34,17 @@ import kda_case
 # because both backends accumulate the recurrence in fp32.
 _CAST = ("query", "key", "value", "gate", "beta")
 
+# tokamax kwarg names for the eight differentiable inputs, in the same order
+# as kda_case.DIFFERENTIABLE.
+_PRIMALS = ("query", "key", "value", "gate", "beta", "a_log",
+            "delta_time_bias", "initial_state")
+
 
 def to_tokamax(case: kda_case.Case, inp: dict[str, np.ndarray]) -> dict:
-  """Canonical [B,T,H,D] -> tokamax's head-first [H,B,T,D] convention."""
+  """Canonical [B,T,H,D] -> tokamax's head-first [H,B,T,D] convention.
+
+  This is the only layout difference from FLA, which is already canonical.
+  """
   hbtd = lambda x: np.ascontiguousarray(x.transpose(2, 0, 1, 3))
 
   args = dict(
@@ -39,15 +52,15 @@ def to_tokamax(case: kda_case.Case, inp: dict[str, np.ndarray]) -> dict:
       key=hbtd(inp["k"]),
       value=hbtd(inp["v"]),
       gate=hbtd(inp["g"]),
-      # tokamax validates beta in [0, 1] (base.py `_validate_beta`), i.e. it
-      # takes POST-activation beta. FlashKDA takes the logits and applies
-      # sigmoid internally. This is the single easiest thing to get wrong.
-      beta=np.ascontiguousarray(
-          kda_case._sigmoid(inp["beta_logits"].astype(np.float64))
-          .astype(np.float32).transpose(2, 0, 1)),
+      # POST-activation beta, validated in [0,1] (base.py `_validate_beta`).
+      # FLA is called with use_beta_sigmoid_in_kernel=False so it takes the
+      # same form -- which also makes `dbeta` the same derivative on both
+      # sides rather than differing by a sigmoid'.
+      beta=np.ascontiguousarray(inp["beta"].transpose(2, 0, 1)),
       a_log=inp["a_log"],
-      # delta_time_bias is flattened to [H*K] and reshaped to
-      # [H,1,1,K] internally (reference.py:44), so row-major [H,K] is correct.
+      # delta_time_bias is flattened to [H*K] and reshaped to [H,1,1,K]
+      # internally (reference.py:44), so row-major [H,K] is correct. FLA
+      # reshapes the same flat buffer to [H,K] too (gate.py).
       delta_time_bias=np.ascontiguousarray(inp["dt_bias"].reshape(-1)),
       scale=float(case.head_dim ** -0.5),
       use_qk_l2norm=True,
@@ -64,8 +77,7 @@ def to_tokamax(case: kda_case.Case, inp: dict[str, np.ndarray]) -> dict:
       seg[0, int(cu[i]):int(cu[i + 1])] = i + 1
     args["segment_ids"] = seg
     args["max_num_segments"] = case.num_states
-    # [N,H,K,V] -> [B=1,N,H,K,V]
-    state_5d = inp["initial_state"][None]
+    state_5d = inp["initial_state"][None]           # [N,H,K,V] -> [1,N,H,K,V]
   else:
     args["segment_ids"] = None
     args["max_num_segments"] = None
@@ -77,12 +89,32 @@ def to_tokamax(case: kda_case.Case, inp: dict[str, np.ndarray]) -> dict:
   return args
 
 
+def _state_to_canonical(case, st):
+  st = np.asarray(st)
+  return np.ascontiguousarray(st[0] if case.is_varlen else st[:, 0])
+
+
 def from_tokamax(case: kda_case.Case, output, final_state):
   """tokamax [H,B,T,V] / [B,N,H,K,V] -> canonical [B,T,H,V] / [N,H,K,V]."""
-  out = np.asarray(output).transpose(1, 2, 0, 3)
-  st = np.asarray(final_state)
-  st = st[0] if case.is_varlen else st[:, 0]
-  return np.ascontiguousarray(out), np.ascontiguousarray(st)
+  out = np.ascontiguousarray(np.asarray(output).transpose(1, 2, 0, 3))
+  return out, _state_to_canonical(case, final_state)
+
+
+def _to_jax(args: dict, dtype: str) -> dict:
+  import jax.numpy as jnp
+
+  jdt = getattr(jnp, dtype)
+  return {
+      k: (jnp.asarray(v, jdt if k in _CAST else None)
+          if isinstance(v, np.ndarray) else v)
+      for k, v in args.items()
+  }
+
+
+def _call(kda_api, kw: dict, impl: str):
+  return kda_api.kimi_delta_attention(
+      kw.pop("query"), kw.pop("key"), kw.pop("value"),
+      kw.pop("gate"), kw.pop("beta"), implementation=impl, **kw)
 
 
 def invoke(case: kda_case.Case, args: dict, impl: str, dtype: str):
@@ -92,32 +124,76 @@ def invoke(case: kda_case.Case, args: dict, impl: str, dtype: str):
   jaxtyping rejects numpy inputs, so callers must not skip this step.
   """
   import jax
-  import jax.numpy as jnp
   from tokamax._src.ops.experimental.kda import api as kda_api
 
-  jdt = getattr(jnp, dtype)
-  arrays = {
-      k: (jnp.asarray(v, jdt if k in _CAST else None)
-          if isinstance(v, np.ndarray) else v)
-      for k, v in args.items()
-  }
-  output, final_state = kda_api.kimi_delta_attention(
-      arrays.pop("query"), arrays.pop("key"), arrays.pop("value"),
-      arrays.pop("gate"), arrays.pop("beta"),
-      implementation=impl, **arrays)
+  output, final_state = _call(kda_api, _to_jax(args, dtype), impl)
   jax.block_until_ready((output, final_state))
   return from_tokamax(case, output, final_state)
 
 
-def run_case(name: str, impl: str, dtype: str, indir: str, outdir: str) -> None:
+def invoke_vjp(case: kda_case.Case, args: dict, inp: dict, impl: str,
+               dtype: str) -> dict:
+  """Forward + VJP. Returns canonical-layout output, final_state, and grads.
+
+  Cotangents come from the shared `.npz` (`do`, `dht`), so the GPU side is
+  seeded with bit-identical values and the gradients can be compared directly
+  rather than only in distribution.
+  """
+  import jax
+  from tokamax._src.ops.experimental.kda import api as kda_api
+
+  arrays = _to_jax(args, dtype)
+  # initial_state is None for stateless cases, and jax.vjp cannot
+  # differentiate a None primal -- drop it from the primal tuple and let it
+  # ride along as a static kwarg instead.
+  keys = [k for k in _PRIMALS if arrays.get(k) is not None]
+  primals = tuple(arrays.pop(k) for k in keys)
+  static = arrays
+
+  def fn(*p):
+    return _call(kda_api, {**dict(zip(keys, p)), **static}, impl)
+
+  (output, final_state), vjp = jax.vjp(fn, *primals)
+  # jax.vjp requires cotangent dtypes to match the primal outputs exactly.
+  do = jax.numpy.asarray(inp["do"].transpose(2, 0, 1, 3), output.dtype)
+  dht = inp["dht"][None] if case.is_varlen else inp["dht"][:, None]
+  grads = vjp((do, jax.numpy.asarray(dht, final_state.dtype)))
+  jax.block_until_ready(grads)
+
+  out, st = from_tokamax(case, output, final_state)
+  res = {"output": out, "final_state": st}
+  # Back to canonical layout, mirroring `to_tokamax` exactly.
+  back = {
+      "query": lambda x: np.asarray(x).transpose(1, 2, 0, 3),
+      "key": lambda x: np.asarray(x).transpose(1, 2, 0, 3),
+      "value": lambda x: np.asarray(x).transpose(1, 2, 0, 3),
+      "gate": lambda x: np.asarray(x).transpose(1, 2, 0, 3),
+      "beta": lambda x: np.asarray(x).transpose(1, 2, 0),
+      "a_log": np.asarray,
+      "delta_time_bias": np.asarray,
+      "initial_state": lambda x: _state_to_canonical(case, x),
+  }
+  names = dict(zip(_PRIMALS, kda_case.DIFFERENTIABLE))
+  for key, gr in zip(keys, grads):
+    res[f"d{names[key]}"] = np.ascontiguousarray(back[key](gr))
+  return res
+
+
+def run_case(name: str, impl: str, dtype: str, indir: str, outdir: str,
+             backward: bool) -> None:
   case = kda_case.CASES[name]
   inp = kda_case.load_inputs(os.path.join(indir, f"in_{name}.npz"))
-  out, st = invoke(case, to_tokamax(case, inp), impl, dtype)
+  args = to_tokamax(case, inp)
+  if backward:
+    res = invoke_vjp(case, args, inp, impl, dtype)
+  else:
+    out, st = invoke(case, args, impl, dtype)
+    res = {"output": out, "final_state": st}
+
   tag = "tpu" if impl == "mosaic" else "tpuref"
   np.savez(os.path.join(outdir, f"{tag}_{name}.npz"),
-           output=out.astype(np.float32), final_state=st.astype(np.float32))
-  print(f"{tag}_{name}: out{out.shape} state{st.shape} "
-        f"dtype={dtype} impl={impl}")
+           **{k: np.asarray(v, np.float32) for k, v in res.items()})
+  print(f"{tag}_{name}: {' '.join(sorted(res))}  dtype={dtype} impl={impl}")
 
 
 def main() -> None:
@@ -126,6 +202,8 @@ def main() -> None:
   p.add_argument("--impl", default="xla", choices=["xla", "mosaic"])
   p.add_argument("--dtype", default="float32",
                  choices=["bfloat16", "float32"])
+  p.add_argument("--backward", action="store_true",
+                 help="also take the VJP and emit the eight gradients")
   p.add_argument("--indir", default="artifacts")
   p.add_argument("--outdir", default="artifacts")
   args = p.parse_args()
@@ -134,7 +212,8 @@ def main() -> None:
   names = list(kda_case.CASES) if args.case == "all" else [args.case]
   for name in names:
     try:
-      run_case(name, args.impl, args.dtype, args.indir, args.outdir)
+      run_case(name, args.impl, args.dtype, args.indir, args.outdir,
+               args.backward)
     except NotImplementedError as e:
       # Mosaic rejects shapes it cannot tile; that is a real result, not a
       # harness failure, so record it rather than aborting the sweep.

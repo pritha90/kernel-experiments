@@ -1,5 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-# Regenerate with `python gdn_case.py`; the runners write their .npz here.
+# Regenerate with `python <op>_case.py`; the runners write their .npz here.
 artifacts/
+artifacts_*/

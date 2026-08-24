@@ -1,30 +1,31 @@
 # Copyright 2026. Apache-2.0.
-"""Compare the KDA artifacts produced by run_tpu.py and run_gpu.py.
+"""Compare the KDA artifacts produced by arbiter.py, run_tpu.py, run_gpu.py.
 
 Runs anywhere -- it only reads .npz files.
 
-Unlike the GDN harness, which had one fp32 reference per side, KDA has a
-single shared arbiter: the float64 recurrence in kda_case.reference(). Every
-backend is scored against it, so a disagreement is attributable rather than
-merely observed.
+Every backend is scored against one shared float64 arbiter, so a
+disagreement is attributable rather than merely observed.
 
-  ref_      arbiter, float64 token-by-token recurrence (kda_case.py)
-  tpuref_   tokamax `implementation="xla"`, fp32
-  tpu_      tokamax `implementation="mosaic"`, the Pallas TPU kernel
-  gpuref_   FlashKDA tests/torch_ref.py -- a bit-exact bf16/fp16 emulation
-            of the CUDA kernel, NOT an fp32 reference
-  gpu_      FlashKDA CUDA kernel
+  npref_    numpy fp64 forward          (kda_case.reference)
+  ref_      JAX fp64 forward + VJP      (arbiter.py)          <- the arbiter
+  tpuref_   tokamax implementation="xla", fp32
+  tpu_      tokamax implementation="mosaic" -- the Pallas TPU kernel
+  gpuref_   FLA naive_recurrent_kda, fp32 torch
+  gpu_      FLA chunk_kda -- the Triton kernel
 
 Stages:
-  --stage semantics   tpuref vs ref. Pure fp32-vs-fp64, no kernels. If this
-                      fails, the conversions in run_tpu.py are wrong and
-                      nothing downstream means anything. Runs on CPU.
-  --stage kernels     everything against the arbiter, plus tpu vs gpu.
+  --stage semantics   npref/tpuref/gpuref vs ref. No kernels, CPU only. This
+                      validates the conversions in both runners, and -- via
+                      npref vs ref -- the arbiter's own forward, which is
+                      what licenses trusting its autodiff gradients.
+  --stage kernels     tpu and gpu vs the arbiter, and tpu vs gpu.
 
-Note the asymmetry in `gpuref vs ref`: torch_ref accumulates its chunk
-inverse in fp16 (CUBLAS_COMPUTE_16F) by design, so it is expected to sit at
-bf16-ish error against the arbiter, not fp32 error. `gpu vs gpuref` is the
-tight one on the GPU side -- those two should agree closely.
+Comparison metric depends on the tensor. `output`, `final_state`, and the
+per-token gradients are compared elementwise. `da_log` and `ddt_bias` are
+reductions over every token and channel (shapes [H] and [H*K]), so their
+magnitude and their accumulated rounding error both scale with B*T -- an
+elementwise atol tuned for per-token tensors is meaningless there. Those two
+are scored on relative norm instead.
 
 Usage:
   python compare.py --stage semantics --dir artifacts
@@ -40,14 +41,29 @@ import numpy as np
 
 import kda_case
 
-TENSORS = ("output", "final_state")
+GRADS = tuple(f"d{n}" for n in kda_case.DIFFERENTIABLE)
+TENSORS = ("output", "final_state") + GRADS
 
-# bf16 has ~3 decimal digits; the recurrence is sequential so error grows with
-# T. These are the thresholds the GDN harness used and are appropriate for a
-# chunked bf16 linear-attention kernel.
+# Gradients that are full reductions over B*T -- scored on relative norm.
+REDUCED = ("da_log", "ddt_bias")
+
+# bf16 has ~3 decimal digits and the recurrence is sequential, so error grows
+# with T. Appropriate for a chunked bf16 linear-attention kernel.
 RTOL, ATOL = 2e-2, 2e-2
+# Relative-norm threshold for the reduced gradients at kernel precision.
+REDUCED_TOL = 2e-2
+
 # fp32 vs fp64 on identical semantics.
 SEMANTIC_TOL = 1e-4
+# Gradients are scored on relative norm at every stage: dq/dk/dg magnitudes
+# vary by orders of magnitude across cases, so a fixed atol is not meaningful.
+SEMANTIC_REL = 1e-5
+
+# `npref vs ref` is fp64-vs-fp64 -- two independent implementations of the
+# same recurrence. Scoring it at SEMANTIC_TOL would be vacuous: it has ~7
+# orders of headroom there and could not fail. This is the tolerance that
+# makes the arbiter self-check an actual check.
+ARBITER_REL = 1e-11
 
 
 def stats(a: np.ndarray, b: np.ndarray) -> dict:
@@ -59,6 +75,7 @@ def stats(a: np.ndarray, b: np.ndarray) -> dict:
       max_abs=float(d.max()),
       mean_abs=float(d.mean()),
       max_rel=float((d / denom).max()),
+      rel_norm=float(np.linalg.norm(a - b) / nb) if nb else float("nan"),
       cos=float(a @ b / (na * nb)) if na and nb else float("nan"),
       # Every predicate here is `<=`, never `not >`: a NaN anywhere makes the
       # comparison False and the case FAIL, which is what we want. A kernel
@@ -68,19 +85,29 @@ def stats(a: np.ndarray, b: np.ndarray) -> dict:
   )
 
 
+def _ok(tensor: str, s: dict, stage: str) -> bool:
+  """Pass predicate for one tensor. All comparisons are `<=`, so NaN fails."""
+  if stage == "arbiter":
+    return s["rel_norm"] <= ARBITER_REL
+  if stage == "semantics":
+    if tensor in GRADS:
+      return s["rel_norm"] <= SEMANTIC_REL
+    return s["max_abs"] <= SEMANTIC_TOL
+  if tensor in REDUCED:
+    return s["rel_norm"] <= REDUCED_TOL
+  return s["passes"]
+
+
 def _load(d: str, tag: str, name: str) -> dict | None:
   p = os.path.join(d, f"{tag}_{name}.npz")
   return dict(np.load(p)) if os.path.exists(p) else None
 
 
-def _row(label: str, s: dict | None, tol: float | None = None) -> str:
-  if s is None:
-    return f"    {label:<16} (missing)"
-  ok = s["passes"] if tol is None else s["max_abs"] <= tol
+def _row(label: str, s: dict, ok: bool) -> str:
   nf = f"  NONFINITE={s['n_nonfinite']}" if s["n_nonfinite"] else ""
-  return (f"    {label:<16} max|d|={s['max_abs']:.3e}  "
-          f"mean|d|={s['mean_abs']:.3e}  maxrel={s['max_rel']:.3e}  "
-          f"cos={s['cos']:.9f}  {'PASS' if ok else 'FAIL'}{nf}")
+  return (f"    {label:<18} max|d|={s['max_abs']:.3e}  "
+          f"relnorm={s['rel_norm']:.3e}  cos={s['cos']:.9f}  "
+          f"{'PASS' if ok else 'FAIL'}{nf}")
 
 
 def _header(name: str) -> None:
@@ -91,50 +118,91 @@ def _header(name: str) -> None:
         f"state={c.with_initial_state} lb={c.lower_bound}")
 
 
+def _shared(ref: dict, other: dict) -> list[str]:
+  """Tensors present on both sides. A backward-less run simply has fewer."""
+  return [t for t in TENSORS if t in ref and t in other]
+
+
 def compare_semantics(name: str, d: str) -> bool | None:
-  """Stage 1: tokamax's own fp32 reference against the arbiter."""
-  ref, tpuref = _load(d, "ref", name), _load(d, "tpuref", name)
-  if ref is None or tpuref is None:
-    print(f"\n=== {name}: SKIP (need ref_ and tpuref_)")
+  """Stage 1: every fp32/fp64 reference against the arbiter, on CPU.
+
+  Three comparisons, all optional but each meaningful on its own:
+    npref  vs ref -> the arbiter's forward is right (two independent fp64
+                     implementations of the recurrence)
+    tpuref vs ref -> run_tpu.py's conversions are right
+    gpuref vs ref -> run_gpu.py's conversions are right
+  """
+  ref = _load(d, "ref", name)
+  if ref is None:
+    print(f"\n=== {name}: SKIP (no ref_ arbiter; run arbiter.py)")
     return None
+  sides = [(tag, _load(d, tag, name))
+           for tag in ("npref", "tpuref", "gpuref")]
+  sides = [(t, v) for t, v in sides if v is not None]
+  if not sides:
+    print(f"\n=== {name}: SKIP (no npref_/tpuref_/gpuref_ artifact)")
+    return None
+
   _header(name)
   ok = True
-  for t in TENSORS:
-    s = stats(tpuref[t], ref[t])
-    good = s["max_abs"] <= SEMANTIC_TOL
-    ok &= good
-    nf = f"  NONFINITE={s['n_nonfinite']}" if s["n_nonfinite"] else ""
-    print(f"  {t:<14} max|d|={s['max_abs']:.3e}  cos={s['cos']:.9f}  "
-          f"{'OK' if good else 'MISMATCH'}{nf}")
+  for tag, side in sides:
+    # npref is the other fp64 forward, so it is held to a far tighter bar
+    # than the fp32 backends.
+    stage = "arbiter" if tag == "npref" else "semantics"
+    for t in _shared(ref, side):
+      s = stats(side[t], ref[t])
+      good = _ok(t, s, stage)
+      ok &= good
+      print(f"  {t:<16} {_row(f'{tag} vs arbiter', s, good).strip()}")
   return ok
 
 
 def compare_kernels(name: str, d: str) -> bool | None:
+  """Stage 2. Scores whatever kernel artifacts exist.
+
+  With both kernels present, `tpu vs gpu` is the verdict. With only one --
+  the usual situation, since a TPU host and a CUDA host are rarely the same
+  machine -- that kernel is scored against the arbiter instead, which is a
+  weaker but genuine result. It is reported as such, not as a cross-check.
+  """
   ref = _load(d, "ref", name)
   tpu, gpu = _load(d, "tpu", name), _load(d, "gpu", name)
   gpuref = _load(d, "gpuref", name)
-  if tpu is None or gpu is None:
-    missing = " and ".join(
-        n for n, a in (("tpu_", tpu), ("gpu_", gpu)) if a is None)
-    print(f"\n=== {name}: SKIP (no {missing} artifact)")
+  if tpu is None and gpu is None:
+    print(f"\n=== {name}: SKIP (no tpu_ or gpu_ artifact)")
     return None
+  if ref is None:
+    print(f"\n=== {name}: SKIP (no ref_ arbiter; run arbiter.py)")
+    return None
+
+  both = tpu is not None and gpu is not None
   _header(name)
+  if not both:
+    which = "tpu" if tpu is not None else "gpu"
+    print(f"  [one-sided: only {which}_ present -> scored against the "
+          f"arbiter, NOT a cross-device check]")
 
   ok = True
-  for t in TENSORS:
+  present = tpu if both else (tpu if tpu is not None else gpu)
+  for t in _shared(ref, present):
     print(f"  {t}")
-    if ref is not None:
-      print(_row("tpu vs arbiter", stats(tpu[t], ref[t]) if tpu else None))
-      print(_row("gpu vs arbiter", stats(gpu[t], ref[t]) if gpu else None))
-      if gpuref is not None:
-        # Expected to be loose: torch_ref accumulates in fp16 on purpose.
-        print(_row("torchref vs arb", stats(gpuref[t], ref[t])))
-    if gpu is not None and gpuref is not None:
-      print(_row("gpu vs torchref", stats(gpu[t], gpuref[t])))
-    if tpu is not None and gpu is not None:
+    for tag, side in (("tpu", tpu), ("gpu", gpu)):
+      if side is not None and t in side:
+        s = stats(side[t], ref[t])
+        good = _ok(t, s, "kernels")
+        print(_row(f"{tag} vs arbiter", s, good))
+        # One-sided runs have no cross-device row, so the arbiter rows are
+        # the verdict; otherwise they are diagnostic only.
+        if not both:
+          ok &= good
+    if gpuref is not None and t in gpuref:
+      s = stats(gpuref[t], ref[t])
+      print(_row("fla-naive vs arb", s, _ok(t, s, "semantics")))
+    if both and t in tpu and t in gpu:
       s = stats(tpu[t], gpu[t])
-      print(_row("tpu vs gpu", s))
-      ok &= s["passes"]
+      good = _ok(t, s, "kernels")
+      print(_row("tpu vs gpu", s, good))
+      ok &= good
   return ok
 
 
@@ -150,8 +218,9 @@ def main() -> None:
   names = list(kda_case.CASES) if args.case == "all" else [args.case]
   results = {n: fn(n, args.dir) for n in names}
 
-  tol = (f"(rtol={RTOL}, atol={ATOL}, on tpu vs gpu)"
-         if args.stage == "kernels" else f"(threshold {SEMANTIC_TOL})")
+  tol = (f"(rtol={RTOL}, atol={ATOL}; reduced grads relnorm<={REDUCED_TOL})"
+         if args.stage == "kernels"
+         else f"(max|d|<={SEMANTIC_TOL}; grads relnorm<={SEMANTIC_REL})")
   print(f"\n{'=' * 64}\nsummary {tol}")
   for n, ok in results.items():
     print(f"  {n:<20} {'SKIP' if ok is None else 'PASS' if ok else 'FAIL'}")

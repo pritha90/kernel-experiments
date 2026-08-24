@@ -218,9 +218,11 @@ def main() -> None:
   args = p.parse_args()
 
   device = args.device or ("cuda" if args.impl == "chunk" else "cpu")
-  if args.impl == "chunk" and not str(device).startswith("cuda"):
-    # FLA's KDA kernels are Triton and there is no CPU fallback. Say so
-    # rather than failing later inside a kernel launch.
+  if args.impl == "chunk" and not (
+      str(device).startswith("cuda") and torch.cuda.is_available()):
+    # FLA's KDA kernels are Triton and there is no CPU fallback. Say so here
+    # rather than surfacing "Torch not compiled with CUDA enabled" from
+    # somewhere inside tensor construction.
     raise SystemExit(
         "--impl chunk requires CUDA (fla.ops.kda is Triton-only). "
         "Use --impl naive to run FLA's semantics on CPU.")

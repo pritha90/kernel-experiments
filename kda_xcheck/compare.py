@@ -183,8 +183,11 @@ def compare_kernels(name: str, d: str) -> bool | None:
           f"arbiter, NOT a cross-device check]")
 
   ok = True
-  present = tpu if both else (tpu if tpu is not None else gpu)
-  for t in _shared(ref, present):
+  # Union, not intersection: if one side ran with --backward and the other
+  # did not, the gradients it did produce should still be scored against the
+  # arbiter rather than vanishing from the report.
+  have = set().union(*(s for s in (tpu, gpu) if s is not None))
+  for t in [t for t in TENSORS if t in ref and t in have]:
     print(f"  {t}")
     for tag, side in (("tpu", tpu), ("gpu", gpu)):
       if side is not None and t in side:
